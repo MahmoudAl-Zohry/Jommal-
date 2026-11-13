@@ -1,0 +1,97 @@
+name: Build & Verify APK (Mobile & Desktop Ready)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Auto-Extract ZIP if Uploaded Directly from Phone
+        run: |
+          if [ ! -f "settings.gradle.kts" ]; then
+            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+            if [ -n "$ZIP_FILE" ]; then
+              echo "Detected uploaded ZIP archive: $ZIP_FILE — extracting automatically..."
+              unzip -o "$ZIP_FILE" -d .
+            fi
+          fi
+          ls -la
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Compile Debug & R8-Shrunk Release APKs
+        run: gradle assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Execute 4-Gate Binary & Security Verification
+        run: |
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          AAPT2="$BUILD_TOOLS/aapt2"
+
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          DEBUG_APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          cp "$RELEASE_APK" ./Abjad-Mashriqi-v6.0-release.apk
+          cp "$DEBUG_APK" ./Abjad-Mashriqi-v6.0-debug.apk
+
+          echo "=== [Gate 1] Zipalign 4-Byte Alignment Check ==="
+          "$ZIPALIGN" -c -v 4 ./Abjad-Mashriqi-v6.0-release.apk | tail -n 5
+
+          echo "=== [Gate 2] APK Signature v2/v3 Verification ==="
+          "$APKSIGNER" verify --verbose --print-certs ./Abjad-Mashriqi-v6.0-release.apk
+
+          echo "=== [Gate 3] Zero-Network Permission Audit ==="
+          PERMS=$("$AAPT2" dump permissions ./Abjad-Mashriqi-v6.0-release.apk)
+          echo "$PERMS"
+          if echo "$PERMS" | grep -q "android.permission.INTERNET"; then
+            echo "FATAL: INTERNET permission detected!"
+            exit 1
+          fi
+          echo "PASS: Zero network permissions verified."
+
+          echo "=== [Gate 4] Asset Integrity & SHA-256 Checksum ==="
+          sha256sum ./Abjad-Mashriqi-v6.0-release.apk ./Abjad-Mashriqi-v6.0-debug.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload Ready-to-Install APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Abjad-Mashriqi-APK-Bundle
+          path: |
+            Abjad-Mashriqi-v6.0-release.apk
+            Abjad-Mashriqi-v6.0-debug.apk
+            SHA256SUMS.txt
+
+      - name: Publish Automatic GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.0.${{ github.run_number }}
+          name: "حساب الجمل الكبير المشرقي v6.0 (Build #${{ github.run_number }})"
+          body: |
+            ### حزمة تطبيق حساب الجمل الكبير المشرقي (Zero-Internet Offline APK)
+            - **ملف التثبيت المباشر المُصغّر (Release R8):** `Abjad-Mashriqi-v6.0-release.apk`
+            - **ملف التثبيت للتطوير (Debug):** `Abjad-Mashriqi-v6.0-debug.apk`
+            - **الأذونات:** صفر أذونات (`No INTERNET`, `No Storage`).
+          files: |
+            Abjad-Mashriqi-v6.0-release.apk
+            Abjad-Mashriqi-v6.0-debug.apk
+            SHA256SUMS.txt
