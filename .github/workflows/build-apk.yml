@@ -1,9 +1,9 @@
-name: Build & Verify APK (Mobile & Desktop Ready)
+name: Build & Verify Jommal APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
 
 permissions:
   contents: write
@@ -11,87 +11,329 @@ permissions:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Auto-Extract ZIP if Uploaded Directly from Phone
-        run: |
-          if [ ! -f "settings.gradle.kts" ]; then
-            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
-            if [ -n "$ZIP_FILE" ]; then
-              echo "Detected uploaded ZIP archive: $ZIP_FILE — extracting automatically..."
-              unzip -o "$ZIP_FILE" -d .
-            fi
-          fi
-          ls -la
-
-      - name: Set up JDK 17 (Temurin)
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      - name: Setup Gradle 8.9
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform and build tools
+        shell: bash
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
-      - name: Compile Debug & R8-Shrunk Release APKs
-        run: gradle assembleDebug assembleRelease --no-daemon --stacktrace
-
-      - name: Execute 4-Gate Binary & Security Verification
+      - name: Extract a ZIP source package if present
+        shell: bash
         run: |
-          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+          set -euo pipefail
+          ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' ! -path './.git/*' -print -quit)"
+          if [ -n "$ZIP_FILE" ]; then
+            mkdir -p .ci-extracted
+            echo "Extracting source package: $ZIP_FILE"
+            unzip -oq "$ZIP_FILE" -d .ci-extracted
+          else
+            echo "No ZIP source package found; using repository files."
+          fi
+
+      - name: Find Android project or generate a WebView wrapper for HTML
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # First, search the whole repository for a Gradle settings file.
+          SETTINGS_FILE="$(find . -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            ! -path './.git/*' ! -path '*/.gradle/*' ! -path '*/build/*' \
+            -print -quit)"
+
+          if [ -n "$SETTINGS_FILE" ]; then
+            PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            echo "Found existing Android/Gradle project: $PROJECT_DIR"
+          else
+            echo "No Gradle project found. Searching for an HTML entry point..."
+
+            HTML_FILE=""
+            for candidate in ./index.html ./www/index.html ./public/index.html ./dist/index.html; do
+              if [ -f "$candidate" ]; then
+                HTML_FILE="$candidate"
+                break
+              fi
+            done
+
+            if [ -z "$HTML_FILE" ]; then
+              HTML_FILE="$(find . -type f -iname 'index.html' \
+                ! -path './.git/*' ! -path './.github/*' ! -path '*/.gradle/*' ! -path '*/build/*' \
+                -print -quit)"
+              if [ -z "$HTML_FILE" ]; then
+                HTML_FILE="$(find . -type f \( -iname '*.html' -o -iname '*.htm' \) \
+                  ! -path './.git/*' ! -path './.github/*' ! -path '*/.gradle/*' ! -path '*/build/*' \
+                  -print -quit)"
+              fi
+            fi
+
+            if [ -z "$HTML_FILE" ]; then
+              echo "::error::No Gradle project and no HTML file were found. Add an Android Gradle project or an HTML entry file (preferably index.html)."
+              echo "Repository files (first 200):"
+              find . -maxdepth 4 -type f ! -path './.git/*' | sort | head -n 200
+              exit 1
+            fi
+
+            HTML_DIR="$(dirname "$HTML_FILE")"
+            PROJECT_DIR="$RUNNER_TEMP/JommalAndroid"
+            ASSET_DIR="$PROJECT_DIR/app/src/main/assets/www"
+            JAVA_DIR="$PROJECT_DIR/app/src/main/java/com/mahmoud/jommal"
+
+            mkdir -p "$ASSET_DIR" "$JAVA_DIR"
+
+            # Copy the complete HTML folder so relative CSS, JS, images and fonts remain available.
+            tar -C "$HTML_DIR" \
+              --exclude='.git' --exclude='.github' --exclude='.gradle' --exclude='build' \
+              --exclude='.ci-extracted' --exclude='*.zip' \
+              -cf - . | tar -C "$ASSET_DIR" -xf -
+
+            # WebView expects index.html. Preserve the original file and make an entry copy if needed.
+            if [ "$(basename "$HTML_FILE")" != "index.html" ]; then
+              cp "$HTML_FILE" "$ASSET_DIR/index.html"
+            fi
+
+            cat > "$PROJECT_DIR/settings.gradle.kts" <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Jommal"
+          include(":app")
+          EOF
+
+            cat > "$PROJECT_DIR/build.gradle.kts" <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+          }
+          EOF
+
+            cat > "$PROJECT_DIR/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+            cat > "$PROJECT_DIR/app/build.gradle.kts" <<'EOF'
+          plugins {
+              id("com.android.application")
+          }
+
+          android {
+              namespace = "com.mahmoud.jommal"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.mahmoud.jommal"
+                  minSdk = 23
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  getByName("release") {
+                      isMinifyEnabled = true
+                      signingConfig = signingConfigs.getByName("debug")
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                  }
+              }
+          }
+          EOF
+
+            cat > "$PROJECT_DIR/app/proguard-rules.pro" <<'EOF'
+          # Add app-specific R8 keep rules here if required.
+          EOF
+
+            cat > "$PROJECT_DIR/app/src/main/AndroidManifest.xml" <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="حساب الجمل الكبير المشرقي"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+            cat > "$JAVA_DIR/MainActivity.java" <<'EOF'
+          package com.mahmoud.jommal;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.loadUrl("file:///android_asset/www/index.html");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+            echo "Generated a minimal offline Android WebView project from: $HTML_FILE"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT_DIR"
+          echo "settings file: $(find "$PROJECT_DIR" -maxdepth 1 -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)"
+
+      - name: Compile Debug and Release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK binaries, signature, alignment and permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
           ZIPALIGN="$BUILD_TOOLS/zipalign"
           APKSIGNER="$BUILD_TOOLS/apksigner"
           AAPT2="$BUILD_TOOLS/aapt2"
 
-          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          DEBUG_APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
-          cp "$RELEASE_APK" ./Abjad-Mashriqi-v6.0-release.apk
-          cp "$DEBUG_APK" ./Abjad-Mashriqi-v6.0-debug.apk
+          RELEASE_APK="$(find "$PROJECT_DIR/app/build/outputs/apk/release" -type f -name '*.apk' -print | head -n 1)"
+          DEBUG_APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -type f -name '*.apk' -print | head -n 1)"
 
-          echo "=== [Gate 1] Zipalign 4-Byte Alignment Check ==="
-          "$ZIPALIGN" -c -v 4 ./Abjad-Mashriqi-v6.0-release.apk | tail -n 5
-
-          echo "=== [Gate 2] APK Signature v2/v3 Verification ==="
-          "$APKSIGNER" verify --verbose --print-certs ./Abjad-Mashriqi-v6.0-release.apk
-
-          echo "=== [Gate 3] Zero-Network Permission Audit ==="
-          PERMS=$("$AAPT2" dump permissions ./Abjad-Mashriqi-v6.0-release.apk)
-          echo "$PERMS"
-          if echo "$PERMS" | grep -q "android.permission.INTERNET"; then
-            echo "FATAL: INTERNET permission detected!"
+          if [ -z "$RELEASE_APK" ] || [ -z "$DEBUG_APK" ]; then
+            echo "::error::Expected release and debug APKs were not produced."
             exit 1
           fi
-          echo "PASS: Zero network permissions verified."
 
-          echo "=== [Gate 4] Asset Integrity & SHA-256 Checksum ==="
-          sha256sum ./Abjad-Mashriqi-v6.0-release.apk ./Abjad-Mashriqi-v6.0-debug.apk > SHA256SUMS.txt
+          cp "$RELEASE_APK" "$GITHUB_WORKSPACE/Jommal-release.apk"
+          cp "$DEBUG_APK" "$GITHUB_WORKSPACE/Jommal-debug.apk"
+          RELEASE_APK="$GITHUB_WORKSPACE/Jommal-release.apk"
+          DEBUG_APK="$GITHUB_WORKSPACE/Jommal-debug.apk"
+
+          # If an existing project produced an unsigned release APK, sign it with the CI debug key.
+          # This is suitable for sideload/testing, not a permanent Play Store signing identity.
+          if ! "$APKSIGNER" verify "$RELEASE_APK" >/dev/null 2>&1; then
+            DEBUG_KEYSTORE="$HOME/.android/debug.keystore"
+            if [ ! -f "$DEBUG_KEYSTORE" ]; then
+              echo "::error::Release APK is unsigned and the Android debug keystore was not generated."
+              exit 1
+            fi
+            "$APKSIGNER" sign \
+              --ks "$DEBUG_KEYSTORE" \
+              --ks-key-alias androiddebugkey \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              "$RELEASE_APK"
+          fi
+
+          echo "=== Gate 1: APK alignment ==="
+          "$ZIPALIGN" -c -v 4 "$RELEASE_APK" | tail -n 5
+
+          echo "=== Gate 2: APK signature ==="
+          "$APKSIGNER" verify --verbose --print-certs "$RELEASE_APK"
+          "$APKSIGNER" verify "$DEBUG_APK"
+
+          echo "=== Gate 3: No INTERNET permission ==="
+          PERMISSIONS="$($AAPT2 dump permissions "$RELEASE_APK")"
+          echo "$PERMISSIONS"
+          if printf '%s\n' "$PERMISSIONS" | grep -q 'android.permission.INTERNET'; then
+            echo "::error::INTERNET permission detected in the release APK."
+            exit 1
+          fi
+          echo "PASS: No INTERNET permission found."
+
+          echo "=== Gate 4: SHA-256 checksums ==="
+          cd "$GITHUB_WORKSPACE"
+          sha256sum Jommal-release.apk Jommal-debug.apk > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Upload Ready-to-Install APK Artifacts
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Abjad-Mashriqi-APK-Bundle
+          name: Jommal-APK-Bundle
           path: |
-            Abjad-Mashriqi-v6.0-release.apk
-            Abjad-Mashriqi-v6.0-debug.apk
+            Jommal-release.apk
+            Jommal-debug.apk
             SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: Publish Automatic GitHub Release
+      - name: Publish GitHub Release
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v6.0.${{ github.run_number }}
-          name: "حساب الجمل الكبير المشرقي v6.0 (Build #${{ github.run_number }})"
+          tag_name: v1.0.${{ github.run_number }}
+          name: "Jommal APK Build #${{ github.run_number }}"
           body: |
-            ### حزمة تطبيق حساب الجمل الكبير المشرقي (Zero-Internet Offline APK)
-            - **ملف التثبيت المباشر المُصغّر (Release R8):** `Abjad-Mashriqi-v6.0-release.apk`
-            - **ملف التثبيت للتطوير (Debug):** `Abjad-Mashriqi-v6.0-debug.apk`
-            - **الأذونات:** صفر أذونات (`No INTERNET`, `No Storage`).
+            Automated Android APK build.
+
+            - `Jommal-release.apk`: release APK (CI/debug signing key if signing was not configured in the project).
+            - `Jommal-debug.apk`: debug APK.
+            - `SHA256SUMS.txt`: SHA-256 checksums.
           files: |
-            Abjad-Mashriqi-v6.0-release.apk
-            Abjad-Mashriqi-v6.0-debug.apk
+            Jommal-release.apk
+            Jommal-debug.apk
             SHA256SUMS.txt
